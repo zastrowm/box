@@ -218,6 +218,22 @@ impl PolicyEngine {
         self.authority.finish_mcp_discovery()
     }
 
+    /// Re-install an authored policy set over this live authority.
+    ///
+    /// The box's decision history is kept, so temporal budgets and rate counters accumulated
+    /// before the reload still apply after it. A rule whose canonical text is unchanged keeps
+    /// its token; a rule whose text changed is a new rule and starts a new budget.
+    ///
+    /// Takes `&self`, so a reload is reachable through the `Arc<PolicyEngine>` the box already
+    /// shares, and serialises against in-flight decisions on the authority's own lock.
+    ///
+    /// The caller owns the question of *who* may ask for this. Nothing here authenticates a
+    /// request: the contained agent must never reach a reload, and the only thing that keeps
+    /// it out is where the trigger lives.
+    pub fn reload(&self, sources: &[Policy]) -> Result<(), PolicyStagingError> {
+        self.authority.reload(sources)
+    }
+
     /// Decide whether `principal` may perform `request`.
     ///
     /// An installed [`DecisionObserver`](crate::DecisionObserver) sees every verdict this

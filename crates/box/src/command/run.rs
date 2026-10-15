@@ -111,6 +111,10 @@ async fn hosted(
 ) -> Result<ExitCode, BoxError> {
     let sources: Vec<Policy> = locked.policy.into_iter().collect();
     let subject = policy_subject(&sources);
+    // Kept before `sources` is consumed: a reload re-reads the operator's authored file, which
+    // is the file the operator edits. The box's own `private/policy.dw` snapshot is a copy
+    // taken at configure time, and is not what a mid-run edit touches.
+    let authored: Vec<PathBuf> = sources.iter().map(|source| source.origin.clone()).collect();
     let operator = crate::record::config::policy_operator()?;
     let policy = match HostedBox::prepare_policy(&locked.root, &operator, sources) {
         Ok(engine) => {
@@ -151,6 +155,9 @@ async fn hosted(
         .clone()
         .ok_or(ConfigError::EmptyWorkload)?;
     let home = agent_home(&agent)?;
+    // Armed before the workload starts, so the box never inherits `SIGUSR1`'s default
+    // disposition (terminate) during the window the agent is alive.
+    let reload = PolicyReloadListener::arm(Arc::clone(&policy), authored, &operator)?;
     eprintln!("strands-box: starting workload");
     let hosted = HostedBox::open(
         &locked.root,
@@ -207,7 +214,10 @@ async fn hosted(
     )?;
     eprintln!("{}", boundary.disclosure());
     let contained = Contained::spawn(boundary, &locked.root, hosted).await?;
-    contained.wait().await
+    let outcome = contained.wait().await;
+    // Ended with the workload, so nothing holds the authority once teardown starts.
+    reload.disarm();
+    outcome
 }
 
 /// The agent's `HOME`: its `env.HOME`, else the operator's own home.
@@ -282,6 +292,111 @@ fn acquire_run_lock(root: &BoxRoot) -> Result<Lock, BoxError> {
         }
         .into()
     })
+}
+
+/// The `SIGUSR1` listener that re-reads the authored policy and installs it over the live
+/// authority.
+///
+/// **This is a demonstration trigger, not a shipping one.** A signal carries no payload and has
+/// no reply path, so the operator who sent it learns nothing about whether the reload applied —
+/// the outcome reaches this box's stderr and its telemetry, and nowhere else. A banner that must
+/// report "allowed" only after the engine confirms cannot be built on this. It exists to make
+/// the reload path demonstrable end to end while the trigger that can acknowledge is designed.
+///
+/// `SIGUSR1` rather than `SIGHUP`: `SIGHUP` already means *stop the workload group*, with a test
+/// pinning that a box under `nohup` stays up.
+struct PolicyReloadListener {
+    #[cfg(unix)]
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PolicyReloadListener {
+    /// Install the handler and start listening.
+    fn arm(
+        policy: Arc<policy::PolicyEngine>,
+        authored: Vec<PathBuf>,
+        operator: &policy::Operator,
+    ) -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut signals = signal(SignalKind::user_defined1())
+                .map_err(|source| DaemonError::ReloadSignal { source })?;
+            if authored.is_empty() {
+                eprintln!(
+                    "strands-box: policy reload on SIGUSR1 is unavailable: this box has no \
+                     authored policy to re-read"
+                );
+            } else {
+                eprintln!(
+                    "strands-box: policy reload armed: kill -USR1 {} (demo trigger)",
+                    std::process::id()
+                );
+            }
+            let operator = operator.clone();
+            let task = tokio::spawn(async move {
+                while signals.recv().await.is_some() {
+                    reload_once(&policy, &authored, &operator);
+                }
+            });
+            Ok(Self { task })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (policy, authored, operator);
+            Ok(Self {})
+        }
+    }
+
+    /// Stop listening.
+    fn disarm(self) {
+        #[cfg(unix)]
+        self.task.abort();
+    }
+}
+
+/// Re-read every authored source and install the result, reporting either outcome.
+///
+/// Both failure modes leave the previous policy serving every request: a file that cannot be
+/// read never reaches the engine, and text that does not validate is refused before the live
+/// lock is taken.
+#[cfg(unix)]
+fn reload_once(policy: &policy::PolicyEngine, authored: &[PathBuf], operator: &policy::Operator) {
+    let mut sources = Vec::with_capacity(authored.len());
+    for path in authored {
+        // Read by path, not by the identity this run recorded: the point of a reload is to pick
+        // up an edit, and an editor that writes by temp-and-rename leaves a different inode.
+        match std::fs::read_to_string(path) {
+            Ok(text) => sources.push(Policy {
+                origin: path.clone(),
+                text,
+            }),
+            Err(source) => {
+                eprintln!(
+                    "strands-box: policy reload refused: cannot read {}: {source}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
+    // Validated the same way `run` validates at startup, so a reload cannot install text that
+    // `run` itself would have refused.
+    if let Err(refusal) = policy::PolicyEngine::validate(operator, &sources) {
+        eprintln!("strands-box: policy reload refused: {refusal}");
+        eprintln!("strands-box: the previous policy is still in force");
+        return;
+    }
+    match policy.reload(&sources) {
+        Ok(()) => eprintln!(
+            "strands-box: policy reloaded from {}",
+            policy_subject(&sources)
+        ),
+        Err(refusal) => {
+            eprintln!("strands-box: policy reload refused: {refusal}");
+            eprintln!("strands-box: the previous policy is still in force");
+        }
+    }
 }
 
 /// Which policy a control record names, by file name rather than by path.
