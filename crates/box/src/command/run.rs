@@ -115,6 +115,8 @@ async fn hosted(
     // is the file the operator edits. The box's own `private/policy.dw` snapshot is a copy
     // taken at configure time, and is not what a mid-run edit touches.
     let authored: Vec<PathBuf> = sources.iter().map(|source| source.origin.clone()).collect();
+    // The control socket lives in private/, captured now while the root is in scope.
+    let control_socket = locked.root.control_socket();
     let operator = crate::record::config::policy_operator()?;
     let policy = match HostedBox::prepare_policy(&locked.root, &operator, sources) {
         Ok(engine) => {
@@ -157,7 +159,11 @@ async fn hosted(
     let home = agent_home(&agent)?;
     // Armed before the workload starts, so the box never inherits `SIGUSR1`'s default
     // disposition (terminate) during the window the agent is alive.
-    let reload = PolicyReloadListener::arm(Arc::clone(&policy), authored, &operator)?;
+    let reload = PolicyReloadListener::arm(Arc::clone(&policy), authored.clone(), &operator)?;
+    // The control socket is the same tap with an acknowledgement: a reload request gets a
+    // reply frame, so the caller learns whether it applied. Agent-unreachable (private/).
+    let control =
+        PolicyControlListener::arm(Arc::clone(&policy), authored, operator, control_socket)?;
     eprintln!("strands-box: starting workload");
     let hosted = HostedBox::open(
         &locked.root,
@@ -217,6 +223,7 @@ async fn hosted(
     let outcome = contained.wait().await;
     // Ended with the workload, so nothing holds the authority once teardown starts.
     reload.disarm();
+    control.disarm();
     outcome
 }
 
@@ -362,6 +369,27 @@ impl PolicyReloadListener {
 /// lock is taken.
 #[cfg(unix)]
 fn reload_once(policy: &policy::PolicyEngine, authored: &[PathBuf], operator: &policy::Operator) {
+    match reload_from_disk(policy, authored, operator) {
+        Ok(subject) => eprintln!("strands-box: policy reloaded from {subject}"),
+        Err(reason) => {
+            eprintln!("strands-box: policy reload refused: {reason}");
+            eprintln!("strands-box: the previous policy is still in force");
+        }
+    }
+}
+
+/// Re-read the authored sources and install them over the live engine.
+///
+/// `Ok(subject)` names what loaded; `Err(reason)` is a human-readable refusal. On `Err` the
+/// previous policy stays in force. This is the one place the signal trigger and the control
+/// socket share: the signal path prints the outcome to stderr, the socket path returns it to
+/// the caller.
+#[cfg(unix)]
+fn reload_from_disk(
+    policy: &policy::PolicyEngine,
+    authored: &[PathBuf],
+    operator: &policy::Operator,
+) -> Result<String, String> {
     let mut sources = Vec::with_capacity(authored.len());
     for path in authored {
         // Read by path, not by the identity this run recorded: the point of a reload is to pick
@@ -371,32 +399,147 @@ fn reload_once(policy: &policy::PolicyEngine, authored: &[PathBuf], operator: &p
                 origin: path.clone(),
                 text,
             }),
-            Err(source) => {
-                eprintln!(
-                    "strands-box: policy reload refused: cannot read {}: {source}",
-                    path.display()
-                );
-                return;
-            }
+            Err(source) => return Err(format!("cannot read {}: {source}", path.display())),
         }
     }
     // Validated the same way `run` validates at startup, so a reload cannot install text that
     // `run` itself would have refused.
     if let Err(refusal) = policy::PolicyEngine::validate(operator, &sources) {
-        eprintln!("strands-box: policy reload refused: {refusal}");
-        eprintln!("strands-box: the previous policy is still in force");
-        return;
+        return Err(refusal.to_string());
     }
-    match policy.reload(&sources) {
-        Ok(()) => eprintln!(
-            "strands-box: policy reloaded from {}",
-            policy_subject(&sources)
-        ),
-        Err(refusal) => {
-            eprintln!("strands-box: policy reload refused: {refusal}");
-            eprintln!("strands-box: the previous policy is still in force");
+    policy.reload(&sources).map_err(|error| error.to_string())?;
+    Ok(policy_subject(&sources))
+}
+
+/// The operator control socket in `box_dir/private/` — the trigger that can **acknowledge**.
+///
+/// Unlike `SIGUSR1`, a connection here is a request/response: the caller sends a reload request
+/// and blocks on a reply frame carrying the outcome, so `strands-box policy reload` can exit 0
+/// on success and non-zero with the reason on a refusal. The socket lives in `private/`, which
+/// the reach floor keeps outside the contained agent's grasp, so the request can only come from
+/// outside the box — the property the agent-reachable broker socket could not give.
+///
+/// This is still a demo: the framing is a line of JSON, not the box's versioned protocol, and
+/// discovery is "read the box_dir from the config" rather than the live record. The production
+/// shape would reuse `protocol.rs` and `live.json`. The security boundary — a socket in
+/// `private/` — is the part that is real.
+struct PolicyControlListener {
+    #[cfg(unix)]
+    task: tokio::task::JoinHandle<()>,
+    #[cfg(unix)]
+    socket: PathBuf,
+}
+
+impl PolicyControlListener {
+    /// Bind the control socket and start accepting reload requests.
+    fn arm(
+        policy: Arc<policy::PolicyEngine>,
+        authored: Vec<PathBuf>,
+        operator: policy::Operator,
+        socket: PathBuf,
+    ) -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            use tokio::net::UnixListener;
+
+            // The run lock proved no other run owns this box, so any socket here is stale.
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket)
+                .map_err(|source| DaemonError::ControlSocket { source })?;
+            // 0600 owner-only. `private/` already puts this beyond the agent's reach; the mode is
+            // defence in depth against anything else running as the operator's user.
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .map_err(|source| DaemonError::ControlSocket { source })?;
+            eprintln!(
+                "strands-box: policy reload control socket ready — `strands-box policy reload --config <file>`"
+            );
+            let task = tokio::spawn(async move {
+                loop {
+                    let stream = match listener.accept().await {
+                        Ok((stream, _)) => stream,
+                        Err(_) => continue,
+                    };
+                    // One request, one response, handled inline so reloads never race.
+                    handle_control_connection(stream, &policy, &authored, &operator).await;
+                }
+            });
+            Ok(Self { task, socket })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (policy, authored, operator, socket);
+            Ok(Self {})
         }
     }
+
+    /// Stop accepting and remove the socket file.
+    fn disarm(self) {
+        #[cfg(unix)]
+        {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+}
+
+/// Read one reload request, run it, and write the outcome back as a JSON reply frame.
+#[cfg(unix)]
+async fn handle_control_connection(
+    stream: tokio::net::UnixStream,
+    policy: &policy::PolicyEngine,
+    authored: &[PathBuf],
+    operator: &policy::Operator,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut request = String::new();
+    if tokio::io::BufReader::new(read_half)
+        .read_line(&mut request)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let reply = match control_reload_reply(&request, policy, authored, operator) {
+        Ok(subject) => {
+            eprintln!("strands-box: policy reloaded from {subject} (via control socket)");
+            serde_json::json!({ "ok": true, "subject": subject })
+        }
+        Err(reason) => {
+            eprintln!("strands-box: policy reload refused: {reason}");
+            eprintln!("strands-box: the previous policy is still in force");
+            serde_json::json!({ "ok": false, "error": reason })
+        }
+    };
+
+    let _ = write_half.write_all(reply.to_string().as_bytes()).await;
+    let _ = write_half.write_all(b"\n").await;
+    let _ = write_half.flush().await;
+}
+
+/// Parse a control request and, if it is a reload, perform it.
+#[cfg(unix)]
+fn control_reload_reply(
+    request: &str,
+    policy: &policy::PolicyEngine,
+    authored: &[PathBuf],
+    operator: &policy::Operator,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ControlRequest {
+        op: String,
+    }
+
+    let parsed: ControlRequest =
+        serde_json::from_str(request.trim()).map_err(|error| format!("bad request: {error}"))?;
+    if parsed.op != "reload" {
+        return Err(format!("unknown op: {}", parsed.op));
+    }
+    reload_from_disk(policy, authored, operator)
 }
 
 /// Which policy a control record names, by file name rather than by path.

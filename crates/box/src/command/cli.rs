@@ -64,4 +64,11 @@ pub(crate) enum PolicyCommand {
         #[arg(long, value_name = "OUTPUT_DIR", required = true)]
         output_dir: PathBuf,
     },
+
+    /// Ask a running box to re-read its policy file, and report whether it applied.
+    Reload {
+        /// The Box configuration naming the box to reload.
+        #[arg(long, value_name = "FILE", required = true)]
+        config: PathBuf,
+    },
 }
