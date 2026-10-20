@@ -55,10 +55,6 @@ const TRUST_CERTIFICATE_FILE: &str = "cert.pem";
 /// Everything no profile placeholder names.
 pub(crate) const PRIVATE_DIRECTORY: &str = "private";
 
-/// The operator's control socket, below [`PRIVATE_DIRECTORY`] so the contained agent cannot
-/// reach it — the trust boundary that lets a reload request come only from outside the box.
-pub(crate) const CONTROL_SOCKET: &str = "control.sock";
-
 /// The mode that marks a recoverable first-record write.
 const FIRST_USE_PRIVATE_MODE: u32 = 0o1700;
 
@@ -559,13 +555,6 @@ impl BoxRoot {
         self.run_directory().join(BROKER_SOCKET)
     }
 
-    /// The operator's control socket, in `private/` where the agent cannot reach it. The
-    /// `strands-box policy reload` client connects here; the agent's own channel is the
-    /// broker socket above, and a reload request must never arrive on that.
-    pub(crate) fn control_socket(&self) -> PathBuf {
-        control_socket_path(&self.root)
-    }
-
     /// Bind the broker socket through the retained run-directory identity.
     pub(crate) fn bind_broker_listener(&self) -> std::io::Result<std::os::unix::net::UnixListener> {
         self.verify_identity().map_err(box_error_as_io)?;
@@ -581,6 +570,7 @@ impl BoxRoot {
     pub(crate) fn trust_directory(&self) -> PathBuf {
         self.root.join(TRUST_DIRECTORY)
     }
+
     /// Create the public trust certificate through the retained trust-directory identity.
     pub(crate) fn open_trust_certificate(&self) -> Result<std::fs::File, BoxError> {
         self.verify_identity()?;
@@ -1907,13 +1897,6 @@ fn open_child_name_with_mode(
     }
     // SAFETY: openat returned one fresh descriptor.
     Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
-}
-
-/// The operator control socket for a box rooted at `box_dir`. Shared by the box (which binds it)
-/// and the `policy reload` client (which connects to it), so both agree on the path without a
-/// duplicated string.
-pub(crate) fn control_socket_path(box_dir: &Path) -> PathBuf {
-    box_dir.join(PRIVATE_DIRECTORY).join(CONTROL_SOCKET)
 }
 
 #[cfg(unix)]

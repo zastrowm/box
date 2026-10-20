@@ -403,12 +403,6 @@ pub(crate) enum DaemonError {
 
     #[error("the egress proxy did not bind a port")]
     NoProxyPort,
-
-    #[error("cannot listen for the policy reload signal: {source}")]
-    ReloadSignal { source: std::io::Error },
-
-    #[error("cannot bind the policy control socket: {source}")]
-    ControlSocket { source: std::io::Error },
 }
 
 /// The workload executable could not be resolved to one exec literal.

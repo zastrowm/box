@@ -50,11 +50,8 @@ pub(crate) fn execute(cli: Cli) -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<ExitCode, BoxError> {
     match &cli.command {
         Command::Run { config, workload } => run::execute(config, workload).await,
-        Command::Policy { command } => match command {
-            PolicyCommand::GenerateSchema { config, output_dir } => {
-                policy::generate_schema(config, output_dir).await
-            }
-            PolicyCommand::Reload { config } => policy::reload(config).await,
-        },
+        Command::Policy {
+            command: PolicyCommand::GenerateSchema { config, output_dir },
+        } => policy::generate_schema(config, output_dir).await,
     }
 }

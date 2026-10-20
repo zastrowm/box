@@ -2311,9 +2311,7 @@ env = {}
             "`run` is the one verb that starts a box, from the complete configuration the \
              operator wrote and `--config` names; it writes no configuration of its own. `policy \
              generate-schema` writes schema artifacts from the workspace's declared MCP servers \
-             and installs no authority. `policy reload` asks a running box to re-read its policy \
-             file over the operator control socket in `private/`, which the contained agent \
-             cannot reach. `ls`, `stop`, `rm`, and `reset` are withdrawn with the \
+             and installs no authority. `ls`, `stop`, `rm`, and `reset` are withdrawn with the \
              `~/.strands-box/b/` namespace they enumerated: a caller supplies `box_dir`, so Box \
              cannot locate a box it was not handed, and the caller that created the directory \
              owns its lifecycle. `init`, `create`, `update`, `configure`, `inspect`, `exec`, \
@@ -2337,7 +2335,7 @@ env = {}
             .get_subcommands()
             .map(clap::Command::get_name)
             .collect();
-        assert_eq!(policy_commands, ["generate-schema", "reload"]);
+        assert_eq!(policy_commands, ["generate-schema"]);
 
         let parsed = Cli::try_parse_from([
             "strands-box",
@@ -2355,17 +2353,6 @@ env = {}
                 command: PolicyCommand::GenerateSchema { config, output_dir }
             } if config == Path::new("box.toml") && output_dir == Path::new("schemas")
         ));
-        let reload =
-            Cli::try_parse_from(["strands-box", "policy", "reload", "--config", "box.toml"])
-                .unwrap();
-        assert!(
-            matches!(
-                reload.command,
-                Command::Policy { command: PolicyCommand::Reload { config } }
-                    if config == Path::new("box.toml")
-            ),
-            "`policy reload` names the box by its configuration, like every other verb"
-        );
         assert!(
             Cli::try_parse_from(["strands-box", "policy", "generate-schema"]).is_err(),
             "schema generation requires named configuration and output paths"
