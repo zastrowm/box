@@ -1,10 +1,10 @@
 //! A rule's path and host literals are judged at load against the spelling a decision reads.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use policy::{
-    ApprovedPath, FsOperation, GovernedBox, Operator, PathResolver, Policy, PolicyEngine,
-    PolicyError, PolicyStagingError, PolicyWarning, Principal, Request,
+    ApprovedPath, FsOperation, FsResult, GovernedBox, Operator, Outcome, PathResolver, Policy,
+    PolicyEngine, PolicyError, PolicyStagingError, PolicyWarning, Principal, Request,
 };
 
 struct Home {
@@ -511,4 +511,120 @@ fn a_trailing_dot_and_an_internationalized_host_are_refused_and_punycode_loads()
         .open("punycode-host", &ace)
         .expect("the punycode spelling loads");
     assert!(!connects(&engine, "xn--bcher-kva.example"));
+}
+
+fn record_connect(engine: &PolicyEngine, host: &str) {
+    engine
+        .record(
+            &GovernedBox::assigned("spelling"),
+            &Principal::agent(),
+            &Outcome::Connect {
+                host,
+                port: 443,
+                address: "127.0.0.1:443".parse().expect("a pinned address"),
+                connected: true,
+            },
+        )
+        .expect("the resolution records");
+}
+
+/// A host literal inside `when temporal` names an event pattern, so the judge reaches it there
+/// too; the canonical spelling is the one the recorded resolution carries.
+#[test]
+fn a_cased_host_literal_in_a_temporal_clause_is_refused_and_its_lowercase_form_caps_the_connects() {
+    let home = Home::new();
+    let cap = |literal: &str| {
+        format!(
+            r#"{CONNECT_ALL}
+            @id("connect_cap")
+            forbid(principal, action == Box::Action::"net:connect", resource)
+            when temporal {{
+                exists (total: Long). (
+                    (count for (t: Timepoint). where (
+                        formerly within 600s (
+                            Box::Action::"net:connect"::response{{ input.host: "{literal}" }}
+                            && tp(t)
+                        )
+                    )) == total && total >= 2
+                )
+            }};"#
+        )
+    };
+
+    let reason = refusal(home.open("temporal-cased-host", &cap("API.Example.com")));
+    assert!(reason.contains("rule @id(\"connect_cap\")"), "{reason}");
+    assert!(reason.contains("write \"api.example.com\""), "{reason}");
+
+    let engine = home
+        .open("temporal-lowercase-host", &cap("api.example.com"))
+        .expect("the lowercase spelling loads");
+    assert!(connects(&engine, "api.example.com"));
+
+    for _ in 0..2 {
+        record_connect(&engine, "other.example.com");
+    }
+    assert!(
+        connects(&engine, "api.example.com"),
+        "the cap counts the host it names and no other"
+    );
+
+    for _ in 0..2 {
+        record_connect(&engine, "api.example.com");
+    }
+    assert!(
+        !connects(&engine, "api.example.com"),
+        "the spelling the judge names must be the spelling that caps"
+    );
+}
+
+/// The same for a path literal, which a recorded filesystem resolution carries in its `~/…` form.
+#[test]
+fn an_absolute_path_under_the_home_in_a_temporal_clause_is_refused_and_its_tilde_form_trips() {
+    let home = Home::new();
+    let tripwire = |literal: &str| {
+        format!(
+            r#"{READ_ALL}
+            @id("no_read_after_secret")
+            forbid(principal, action == Box::Action::"fs:read", resource)
+            when temporal {{
+                formerly within 300s
+                Box::Action::"fs:read"::response{{ input.path: "{literal}" }}
+            }};"#
+        )
+    };
+
+    let absolute = home.canonical.join("project/secrets.env");
+    let reason = refusal(home.open(
+        "temporal-absolute",
+        &tripwire(&absolute.display().to_string()),
+    ));
+    assert!(
+        reason.contains("rule @id(\"no_read_after_secret\")"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("write \"~/project/secrets.env\""),
+        "{reason}"
+    );
+
+    let engine = home
+        .open("temporal-tilde", &tripwire("~/project/secrets.env"))
+        .expect("the ~ spelling loads");
+    assert!(reads(&engine, &home.approved("project/notes.md")));
+
+    engine
+        .record(
+            &GovernedBox::assigned("spelling"),
+            &Principal::agent(),
+            &Outcome::Fs {
+                path: Path::new("~/project/secrets.env"),
+                operation: FsOperation::ReadContent,
+                result: FsResult::Completed,
+            },
+        )
+        .expect("the read records");
+    assert!(
+        !reads(&engine, &home.approved("project/notes.md")),
+        "the tripwire fires on the spelling the resolution reports"
+    );
 }

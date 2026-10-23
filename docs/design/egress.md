@@ -107,10 +107,12 @@ address, and other IPv6 addresses are compressed and lowercase. A rule matches i
 
 **The host is one spelling too.** The gateway lowercases it and removes a trailing dot, so a request
 for `API.GitHub.com.` and a request for `api.github.com` reach policy as the same host. A rule
-carries that spelling as well, because a comparison is exact. A host literal that a `when` clause
-compares is held to that spelling at load, and the refusal names the form to write ([a rule that
-cannot fire is refused at
-load](decisions.md#a-rule-that-cannot-fire-is-refused-at-load-and-an-uncertain-one-warns)). An
+carries that spelling as well, because a comparison is exact. A rule that names `net:connect` or
+`http:request` is held to it at load, in a `when` clause and in a `when temporal` event pattern
+alike, and the refusal names the form to write ([a rule that cannot fire is refused at
+load](decisions.md#a-rule-that-cannot-fire-is-refused-at-load-and-an-uncertain-one-warns)). A rule
+that constrains no action is not held to it, because `host` is then the argument of a tool action as
+often as a destination. An
 internationalized domain reaches the gateway in its punycode form, so a rule names that form.
 
 ### TLS and `http:request`

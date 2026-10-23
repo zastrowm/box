@@ -155,7 +155,7 @@ pub fn event_schema_source() -> &'static str {
     EVENTS_DWSCHEMA
 }
 
-fn service_schema() -> Result<ServiceSchema, PolicyError> {
+pub(crate) fn service_schema() -> Result<ServiceSchema, PolicyError> {
     ServiceSchema::builder()
         .event_schema_str(EVENTS_DWSCHEMA)
         .build()
@@ -613,7 +613,7 @@ fn validate_and_expand(
         return Err(PolicyError::Schema(joined));
     }
 
-    let warnings = crate::spelling::judge(lowered.as_cedar(), operator)?
+    let warnings = crate::spelling::judge(&lowered, operator)?
         .into_iter()
         .chain(cap_warnings)
         .collect();

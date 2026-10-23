@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use cedar_policy::{ActionConstraint, EntityUid, Policy, PolicySet};
+use dogwood_language::LoweredPolicySet;
+use dogwood_language::temporal_ast::{AggExprKind, Condition, ConditionKind, Predicate, Term};
 use egress_gateway::{is_bindable_host, normalize_host};
 use serde_json::Value;
 
@@ -128,6 +130,16 @@ enum Finding {
 
 /// Refuse every literal that no reported spelling can match; return the uncertain ones.
 pub(crate) fn judge(
+    lowered: &LoweredPolicySet,
+    operator: &Operator,
+) -> Result<Vec<PolicyWarning>, PolicyError> {
+    let mut warnings = judge_when_clauses(lowered.as_cedar(), operator)?;
+    warnings.extend(judge_temporal_clauses(lowered, operator)?);
+    Ok(warnings)
+}
+
+/// Refuse every literal a `when`/`unless` clause compares an input attribute with.
+fn judge_when_clauses(
     policies: &PolicySet,
     operator: &Operator,
 ) -> Result<Vec<PolicyWarning>, PolicyError> {
@@ -171,6 +183,147 @@ pub(crate) fn judge(
         }
     }
     Ok(warnings)
+}
+
+/// Refuse every literal a `when temporal` event pattern binds an input attribute to.
+fn judge_temporal_clauses(
+    lowered: &LoweredPolicySet,
+    operator: &Operator,
+) -> Result<Vec<PolicyWarning>, PolicyError> {
+    let homes = operator.homes();
+    let cedar = lowered.as_cedar();
+    let mut warnings = Vec::new();
+    for field in lowered.temporal_fields() {
+        let mut bindings = Vec::new();
+        collect_bindings(&field.condition.condition, &mut bindings);
+        for (scope, attribute, literal) in bindings {
+            let Some(checks) = scope.checks(&attribute) else {
+                continue;
+            };
+            match judge_literal(&attribute, &literal, &homes, checks) {
+                Finding::Sound | Finding::Uncertain(_) => {}
+                Finding::Inert(reason) => {
+                    return Err(PolicyError::Spelling(format!(
+                        "{} {reason}",
+                        leaf_rule_name(cedar, &field.id)
+                    )));
+                }
+                Finding::ProgramPath(literal) => {
+                    warnings.push(PolicyWarning::ProgramSpelledAsPath {
+                        rule: leaf_rule_name(cedar, &field.id),
+                        literal,
+                    });
+                }
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// The rule whose lowered condition reads the temporal leaf bound into `context.<id>`.
+fn leaf_rule_name(policies: &PolicySet, id: &str) -> String {
+    policies
+        .policies()
+        .find(|policy| {
+            policy
+                .to_json()
+                .is_ok_and(|est| reads_context_attribute(&est["conditions"], id))
+        })
+        .map_or_else(
+            || "the rule with the temporal clause".to_string(),
+            rule_name,
+        )
+}
+
+fn reads_context_attribute(node: &Value, attribute: &str) -> bool {
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| reads_context_attribute(item, attribute)),
+        Value::Object(fields) => {
+            let names_it = fields.get(".").is_some_and(|access| {
+                access.get("attr").and_then(Value::as_str) == Some(attribute)
+                    && access
+                        .get("left")
+                        .and_then(|left| left.get("Var"))
+                        .and_then(Value::as_str)
+                        == Some("context")
+            });
+            names_it
+                || fields
+                    .values()
+                    .any(|value| reads_context_attribute(value, attribute))
+        }
+        _ => false,
+    }
+}
+
+/// Every `input.<attribute>` literal an event pattern in `condition` binds, under the scope of the
+/// action that pattern names.
+fn collect_bindings(condition: &Condition, out: &mut Vec<(Scope, String, String)>) {
+    match &condition.kind {
+        ConditionKind::And { left, right }
+        | ConditionKind::Or { left, right }
+        | ConditionKind::Since { left, right, .. } => {
+            collect_bindings(left, out);
+            collect_bindings(right, out);
+        }
+        ConditionKind::Not { inner } => collect_bindings(inner, out),
+        ConditionKind::Formerly { body, .. }
+        | ConditionKind::Previous { body, .. }
+        | ConditionKind::Exists { body, .. } => collect_bindings(body, out),
+        ConditionKind::Predicate(predicate) => collect_pattern(predicate, out),
+        ConditionKind::Comparison { left, right, .. } => {
+            collect_aggregate(left, out);
+            collect_aggregate(right, out);
+        }
+        ConditionKind::Refine { base, .. } => collect_bindings(base, out),
+        ConditionKind::Tp { .. } | ConditionKind::Call(_) | ConditionKind::SigilRef { .. } => {}
+    }
+}
+
+fn collect_aggregate(term: &Term, out: &mut Vec<(Scope, String, String)>) {
+    match term {
+        Term::Agg(aggregate) => match &aggregate.kind {
+            AggExprKind::Sum { body, .. } | AggExprKind::Count { body, .. } => {
+                collect_bindings(body, out);
+            }
+            AggExprKind::Call(_) => {}
+        },
+        Term::Array(terms) => terms.iter().for_each(|term| collect_aggregate(term, out)),
+        Term::Entity { .. }
+        | Term::Integer(_)
+        | Term::Decimal(_)
+        | Term::String(_)
+        | Term::Bool(_)
+        | Term::ContextField(_)
+        | Term::ScopeField(_)
+        | Term::Var(_)
+        | Term::Wildcard
+        | Term::ParamRef(_)
+        | Term::BinderRef(_) => {}
+    }
+}
+
+fn collect_pattern(predicate: &Predicate, out: &mut Vec<(Scope, String, String)>) {
+    if predicate.namespace.join("::") != BOX_ACTION_TYPE {
+        return;
+    }
+    let Some(scope) = Scope::of_action(&predicate.action) else {
+        return;
+    };
+    for argument in &predicate.args {
+        let path = argument.field_path();
+        let [root, attribute] = path.as_slice() else {
+            continue;
+        };
+        if root != "input" {
+            continue;
+        }
+        if let Term::String(literal) = &argument.value {
+            out.push((scope, attribute.clone(), literal.clone()));
+        }
+    }
 }
 
 /// Whether every action in the rule's scope is `fs:other`.
@@ -230,7 +383,11 @@ impl Scope {
     }
 
     fn family(uid: &EntityUid) -> Option<Self> {
-        let id = uid.id().escaped();
+        Self::of_action(&uid.id().escaped())
+    }
+
+    /// The family of one `Box::Action` id.
+    fn of_action(id: &str) -> Option<Self> {
         if id.starts_with("fs:") {
             Some(Self::Filesystem)
         } else if id.starts_with("shell:") {
@@ -593,6 +750,17 @@ mod tests {
         source.parse().expect("the policy parses")
     }
 
+    /// A Dogwood lowering, which a `when temporal` clause needs.
+    fn lowered(source: &str) -> LoweredPolicySet {
+        LoweredPolicySet::from_str(
+            source,
+            &crate::dogwood::service_schema().expect("the event schema"),
+            &dogwood_language::PolicySchema::from_cedarschema_str(crate::schema::SCHEMA_SRC)
+                .expect("the action schema"),
+        )
+        .expect("the policy lowers")
+    }
+
     fn anchored() -> Operator {
         Operator::unanchored().anchored_at("/Users/me")
     }
@@ -604,7 +772,9 @@ mod tests {
             permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/Users/me/project/secrets.env" };"#,
         );
-        let error = judge(&policies, &anchored()).unwrap_err().to_string();
+        let error = judge_when_clauses(&policies, &anchored())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("rule @id(\"secrets\")"), "{error}");
         assert!(error.contains("\"~/project/secrets.env\""), "{error}");
 
@@ -612,7 +782,9 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/Users/me/project/" };"#,
         );
-        let error = judge(&directory, &anchored()).unwrap_err().to_string();
+        let error = judge_when_clauses(&directory, &anchored())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("write \"~/project\""), "{error}");
     }
 
@@ -622,7 +794,7 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/Users/meow/file" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
     }
 
     #[test]
@@ -631,14 +803,16 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path like "/Users/me/project/*" };"#,
         );
-        let error = judge(&rooted, &anchored()).unwrap_err().to_string();
+        let error = judge_when_clauses(&rooted, &anchored())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("\"~/project/*\""), "{error}");
 
         let later = parsed(
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path like "*/Users/me/*" };"#,
         );
-        let warnings = judge(&later, &anchored()).expect("a warning, not a refusal");
+        let warnings = judge_when_clauses(&later, &anchored()).expect("a warning, not a refusal");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].to_string().contains("*/Users/me/*"));
 
@@ -647,7 +821,7 @@ mod tests {
             when { context.input.path like "/opt/Users/me/*" || context.input.path like "*/opt/Users/meow/*" };"#,
         );
         assert!(
-            judge(&interior, &anchored())
+            judge_when_clauses(&interior, &anchored())
                 .expect("distinct paths")
                 .is_empty()
         );
@@ -659,7 +833,7 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "~/project/" };"#,
         );
-        let error = judge(&literal, &Operator::unanchored())
+        let error = judge_when_clauses(&literal, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"~/project\""), "{error}");
@@ -668,7 +842,7 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path like "~/*/" };"#,
         );
-        let error = judge(&pattern, &Operator::unanchored())
+        let error = judge_when_clauses(&pattern, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"~/*\""), "{error}");
@@ -680,7 +854,7 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/" || context.input.path like "/" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
     }
 
     #[test]
@@ -689,7 +863,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/etc/hosts" };"#,
         );
-        let error = judge(&policies, &Operator::unanchored().anchored_at("/"))
+        let error = judge_when_clauses(&policies, &Operator::unanchored().anchored_at("/"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"~/etc/hosts\""), "{error}");
@@ -698,7 +872,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "~/etc/hosts" };"#,
         );
-        assert!(judge(&relative, &Operator::unanchored().anchored_at("/")).is_ok());
+        assert!(judge_when_clauses(&relative, &Operator::unanchored().anchored_at("/")).is_ok());
     }
 
     #[cfg(unix)]
@@ -726,7 +900,9 @@ mod tests {
         ));
         let operator = Operator::unanchored().anchored_at(&link);
         for policies in [through_link, through_real] {
-            let error = judge(&policies, &operator).unwrap_err().to_string();
+            let error = judge_when_clauses(&policies, &operator)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("write \"~/.aws/credentials\""), "{error}");
         }
     }
@@ -737,7 +913,8 @@ mod tests {
             r#"permit(principal, action == Box::Action::"shell:spawn", resource)
             when { context.input.program == "/usr/bin/curl" || context.input.program like "*/wget" };"#,
         );
-        let warnings = judge(&policies, &Operator::unanchored()).expect("a warning, not a refusal");
+        let warnings = judge_when_clauses(&policies, &Operator::unanchored())
+            .expect("a warning, not a refusal");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings
@@ -758,7 +935,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path like "/Users/meow/*" || context.input.path like "*/Users/meow/*" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
     }
 
     #[test]
@@ -767,7 +944,7 @@ mod tests {
             r#"permit(principal, action == Box::Action::"shell:spawn", resource)
             when { context.input.program_path == "/usr/bin/curl" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
     }
 
     #[test]
@@ -776,13 +953,13 @@ mod tests {
             r#"permit(principal, action == Box::Action::"fs:read", resource)
             when { "/Users/me/x" == context.input.path };"#,
         );
-        assert!(judge(&reversed, &anchored()).is_err());
+        assert!(judge_when_clauses(&reversed, &anchored()).is_err());
 
         let set = parsed(
             r#"permit(principal, action in [Box::Action::"fs:read", Box::Action::"fs:write"], resource)
             when { ["~/a", "/Users/me/b"].contains(context.input.path) };"#,
         );
-        assert!(judge(&set, &anchored()).is_err());
+        assert!(judge_when_clauses(&set, &anchored()).is_err());
     }
 
     #[test]
@@ -792,7 +969,7 @@ mod tests {
             when { context has input && context.input has path
                 && context.input.path == "/Users/me/project/secrets.env" };"#,
         );
-        assert!(judge(&broad_forbid, &anchored()).is_err());
+        assert!(judge_when_clauses(&broad_forbid, &anchored()).is_err());
 
         let broad_program = parsed(
             r#"forbid(principal, action, resource)
@@ -800,7 +977,9 @@ mod tests {
                 && context.input.program == "/usr/bin/curl" };"#,
         );
         assert_eq!(
-            judge(&broad_program, &anchored()).expect("a warning").len(),
+            judge_when_clauses(&broad_program, &anchored())
+                .expect("a warning")
+                .len(),
             1
         );
 
@@ -808,26 +987,26 @@ mod tests {
             r#"permit(principal, action == Box::Action::"http:request", resource)
             when { context.input.path == "/v1/models/" || context.input.path == "/Users/me/api" };"#,
         );
-        assert!(judge(&url, &anchored()).is_ok());
+        assert!(judge_when_clauses(&url, &anchored()).is_ok());
 
         let network_only = parsed(
             r#"permit(principal, action in [Box::Action::"http:request", Box::Action::"net:connect"], resource)
             when { context.input has path && context.input.path == "/Users/me/api" };"#,
         );
-        assert!(judge(&network_only, &anchored()).is_ok());
+        assert!(judge_when_clauses(&network_only, &anchored()).is_ok());
 
         let mixed = parsed(
             r#"permit(principal, action in [Box::Action::"fs:read", Box::Action::"http:request"], resource)
             when { context.input.path == "/v1/" };"#,
         );
-        assert!(judge(&mixed, &anchored()).is_ok());
+        assert!(judge_when_clauses(&mixed, &anchored()).is_ok());
 
         let baseline_shape = parsed(
             r#"forbid(principal, action, resource)
             when { context has input && context.input has path
                 && context.input.path like "*/.strands-box/mcp-schemas/*" };"#,
         );
-        assert!(judge(&baseline_shape, &anchored()).is_ok());
+        assert!(judge_when_clauses(&baseline_shape, &anchored()).is_ok());
     }
 
     #[test]
@@ -836,13 +1015,13 @@ mod tests {
             r#"permit(principal, action == alpha::Action::"read", resource)
             when { context.input.path == "/Users/me/tool-argument" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
 
         let mixed = parsed(
             r#"permit(principal, action in [Box::Action::"fs:read", alpha::Action::"read"], resource)
             when { context.input.path == "/Users/me/tool-argument" };"#,
         );
-        assert!(judge(&mixed, &anchored()).is_ok());
+        assert!(judge_when_clauses(&mixed, &anchored()).is_ok());
     }
 
     #[test]
@@ -851,7 +1030,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"fs:read", resource)
             when { context.input.path == "/etc/hosts" };"#,
         );
-        assert!(judge(&policies, &anchored()).is_ok());
+        assert!(judge_when_clauses(&policies, &anchored()).is_ok());
     }
 
     #[test]
@@ -868,7 +1047,7 @@ mod tests {
                 forbid(principal, action == Box::Action::"net:connect", resource)
                 when {{ context.input.host == "{literal}" }};"#
             ));
-            let error = judge(&policies, &Operator::unanchored())
+            let error = judge_when_clauses(&policies, &Operator::unanchored())
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("rule @id(\"block_host\")"), "{error}");
@@ -884,7 +1063,7 @@ mod tests {
                 r#"forbid(principal, action == Box::Action::"http:request", resource)
                 when {{ context.input.host == "{literal}" }};"#
             ));
-            let error = judge(&policies, &Operator::unanchored())
+            let error = judge_when_clauses(&policies, &Operator::unanchored())
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("punycode"), "{error}");
@@ -898,7 +1077,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host == "api.example.com:443" };"#,
         );
-        let error = judge(&policies, &Operator::unanchored())
+        let error = judge_when_clauses(&policies, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"api.example.com\""), "{error}");
@@ -918,7 +1097,7 @@ mod tests {
                 when {{ context.input.host == "{literal}" }};"#
             ));
             assert!(
-                judge(&policies, &Operator::unanchored()).is_err(),
+                judge_when_clauses(&policies, &Operator::unanchored()).is_err(),
                 "{literal:?} binds to no host and must be refused"
             );
         }
@@ -943,7 +1122,7 @@ mod tests {
                 when {{ context.input.host == "{literal}" }};"#
             ));
             assert!(
-                judge(&policies, &Operator::unanchored()).is_ok(),
+                judge_when_clauses(&policies, &Operator::unanchored()).is_ok(),
                 "{literal:?} is a host the gateway binds and must load"
             );
         }
@@ -955,7 +1134,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "*.Example.com" };"#,
         );
-        let error = judge(&cased, &Operator::unanchored())
+        let error = judge_when_clauses(&cased, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"*.example.com\""), "{error}");
@@ -964,7 +1143,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "*.example.com." };"#,
         );
-        let error = judge(&dotted, &Operator::unanchored())
+        let error = judge_when_clauses(&dotted, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"*.example.com\""), "{error}");
@@ -973,14 +1152,14 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "https://*" };"#,
         );
-        assert!(judge(&scheme, &Operator::unanchored()).is_err());
+        assert!(judge_when_clauses(&scheme, &Operator::unanchored()).is_err());
 
         let sound = parsed(
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "*.example.com"
                 || context.input.host like "*bedrock-agentcore.*.amazonaws.com" };"#,
         );
-        assert!(judge(&sound, &Operator::unanchored()).is_ok());
+        assert!(judge_when_clauses(&sound, &Operator::unanchored()).is_ok());
     }
 
     /// The host arm reaches the reversed-operand and set-membership shapes, not only a plain `==`.
@@ -990,13 +1169,142 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { "API.Example.com" == context.input.host };"#,
         );
-        assert!(judge(&reversed, &Operator::unanchored()).is_err());
+        assert!(judge_when_clauses(&reversed, &Operator::unanchored()).is_err());
 
         let set = parsed(
             r#"forbid(principal, action in [Box::Action::"net:connect", Box::Action::"http:request"], resource)
             when { ["api.example.com", "API.Other.com"].contains(context.input.host) };"#,
         );
-        assert!(judge(&set, &Operator::unanchored()).is_err());
+        assert!(judge_when_clauses(&set, &Operator::unanchored()).is_err());
+    }
+
+    #[test]
+    fn a_cased_host_literal_in_a_temporal_clause_is_refused_with_its_canonical_spelling() {
+        let policies = lowered(
+            r#"@id("rate_limit")
+            permit(principal, action == Box::Action::"http:request", resource)
+            when temporal {
+                exists (total: Long). (
+                    (count for (t: Timepoint). where (
+                        formerly within 10m (
+                            Box::Action::"http:request"::response{ input.host: "API.Example.com" }
+                            && tp(t)
+                        )
+                    )) == total && total >= 60
+                )
+            };"#,
+        );
+        let error = judge(&policies, &Operator::unanchored())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rule @id(\"rate_limit\")"), "{error}");
+        assert!(error.contains("write \"api.example.com\""), "{error}");
+    }
+
+    #[test]
+    fn a_temporal_clause_judges_the_home_and_the_trailing_slash_on_every_path_attribute() {
+        for (attribute, action, literal, corrected) in [
+            (
+                PATH,
+                "fs:read",
+                "/Users/me/project/secrets.env",
+                "~/project/secrets.env",
+            ),
+            (PATH, "fs:read", "~/project/", "~/project"),
+            (
+                PROGRAM_PATH,
+                "shell:spawn",
+                "/Users/me/bin/tool",
+                "~/bin/tool",
+            ),
+        ] {
+            let policies = lowered(&format!(
+                r#"@id("tripwire")
+                forbid(principal, action == Box::Action::"{action}", resource)
+                when temporal {{
+                    formerly within 10m
+                    Box::Action::"{action}"::response{{ input.{attribute}: "{literal}" }}
+                }};"#
+            ));
+            let error = judge(&policies, &anchored()).unwrap_err().to_string();
+            assert!(error.contains("rule @id(\"tripwire\")"), "{error}");
+            assert!(error.contains(&format!("write \"{corrected}\"")), "{error}");
+        }
+    }
+
+    /// A pattern is judged under the action it names, not under the scope of the rule holding it.
+    #[test]
+    fn a_temporal_pattern_is_judged_under_the_action_it_names() {
+        let tripwire = lowered(
+            r#"@id("no_egress_after_credentials")
+            permit(principal, action == Box::Action::"http:request", resource)
+            unless temporal {
+                formerly within 300s
+                Box::Action::"fs:read"::response{ input.path: "/Users/me/.aws/credentials" }
+            };"#,
+        );
+        let error = judge(&tripwire, &anchored()).unwrap_err().to_string();
+        assert!(
+            error.contains("rule @id(\"no_egress_after_credentials\")"),
+            "{error}"
+        );
+        assert!(error.contains("write \"~/.aws/credentials\""), "{error}");
+
+        let url = lowered(
+            r#"forbid(principal, action == Box::Action::"fs:read", resource)
+            when temporal {
+                formerly within 10m
+                Box::Action::"http:request"::response{ input.path: "/Users/me/api" }
+            };"#,
+        );
+        assert!(
+            judge(&url, &anchored()).is_ok(),
+            "an http:request pattern carries a URL path, whatever the rule's own scope"
+        );
+    }
+
+    #[test]
+    fn a_temporal_program_literal_spelled_as_a_path_warns_and_names_program_path() {
+        let policies = lowered(
+            r#"@id("after_curl")
+            forbid(principal, action == Box::Action::"shell:exec", resource)
+            when temporal {
+                formerly within 10m
+                Box::Action::"shell:exec"::response{ input.program: "/usr/bin/curl" }
+            };"#,
+        );
+        let warnings = judge(&policies, &Operator::unanchored()).expect("a warning, not a refusal");
+        let [warning] = warnings.as_slice() else {
+            panic!("exactly one warning, got {warnings:?}");
+        };
+        assert!(
+            matches!(warning, PolicyWarning::ProgramSpelledAsPath { rule, .. } if rule == "rule @id(\"after_curl\")"),
+            "{warning:?}"
+        );
+        assert!(warning.to_string().contains("context.input.program_path"));
+    }
+
+    /// Every spelling a recorded event carries must load, so the walk refuses nothing an operator
+    /// needs.
+    #[test]
+    fn a_canonical_temporal_literal_is_sound() {
+        let policies = lowered(
+            r#"forbid(principal, action, resource)
+            when temporal {
+                formerly within 10m (
+                    Box::Action::"net:connect"::response{ input.host: "api.example.com" }
+                    && Box::Action::"fs:read"::response{ input.path: "~/project/secrets.env" }
+                    && Box::Action::"shell:exec"::response{ input.program: "curl" }
+                    && Box::Action::"shell:spawn"::response{ input.program_path: "/usr/bin/curl" }
+                    && Box::Action::"mcp:call"::response{ input.server: "GitHub" }
+                )
+            };"#,
+        );
+        assert!(
+            judge(&policies, &anchored())
+                .expect("every canonical spelling loads")
+                .is_empty()
+        );
     }
 
     /// Under an unconstrained action, `host` may be the argument of a generated MCP tool action
@@ -1015,7 +1323,7 @@ mod tests {
                     && context.input.host == "{literal}" }};"#
             ));
             assert!(
-                judge(&broad, &Operator::unanchored()).is_ok(),
+                judge_when_clauses(&broad, &Operator::unanchored()).is_ok(),
                 "{literal:?} may be a tool argument under an unconstrained action"
             );
         }
@@ -1024,7 +1332,7 @@ mod tests {
             r#"forbid(principal, action in [Box::Action::"net:connect", Box::Action::"fs:read"], resource)
             when { context.input.host == "API.Example.com" };"#,
         );
-        assert!(judge(&mixed, &Operator::unanchored()).is_ok());
+        assert!(judge_when_clauses(&mixed, &Operator::unanchored()).is_ok());
     }
 
     /// A refusal never names a spelling that is itself unreachable, so the unreachable byte is
@@ -1035,7 +1343,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "API/path*" };"#,
         );
-        let error = judge(&both, &Operator::unanchored())
+        let error = judge_when_clauses(&both, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("a host holds no \"/\""), "{error}");
@@ -1045,7 +1353,7 @@ mod tests {
             r#"forbid(principal, action == Box::Action::"net:connect", resource)
             when { context.input.host like "API.Example.com" };"#,
         );
-        let error = judge(&cased_only, &Operator::unanchored())
+        let error = judge_when_clauses(&cased_only, &Operator::unanchored())
             .unwrap_err()
             .to_string();
         assert!(error.contains("write \"api.example.com\""), "{error}");
@@ -1063,7 +1371,7 @@ mod tests {
                 r#"forbid(principal, action == Box::Action::"net:connect", resource)
                 {source};"#
             ));
-            let error = judge(&policies, &Operator::unanchored())
+            let error = judge_when_clauses(&policies, &Operator::unanchored())
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("a host is never empty"), "{source}: {error}");
