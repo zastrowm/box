@@ -393,8 +393,16 @@ under a grant is now the operator's stated reach**, named on stderr by the grant
 The box defends the authority it loaded, and re-checks that by identity at every spawn, which
 `a_spawn_refuses_a_reach_whose_subtracted_authority_moved` pins.
 
-Three limits to plan around. On Linux a writable bind is also readable, so `write` without `read`
-holds on macOS only, and the disclosure names such an entry as readable too. On Linux, when the
+Three limits to plan around. Linux writable mounts also permit reads. Box therefore refuses each
+Linux write grant without explicit read coverage before any agent, tool, or local server runs.
+A matching file read or an enclosing directory read supplies that coverage. A child read cannot
+cover a parent write grant. macOS retains write-only access. The disclosure names complete and
+partial read-write access. `linux_rejects_write_only_before_any_process_runs` pins startup refusal.
+`explicit_read_write_succeeds_for_every_process_and_scope` pins explicit access and overlapping scopes.
+This accepted platform limitation avoids silently adding read permission. Landlock is the planned
+long-term approach; its implementation and qualification remain deferred.
+
+On Linux, when the
 authority directory sits more than one level below a write grant, the workload can rename the
 ancestor between them and create a fresh directory at the vacated path, which a later run whose
 `--config` names that path adopts; macOS refuses the ancestor rename, and
@@ -477,10 +485,13 @@ parses a harness's own configuration file to find one.
 
 A sandbox for a stdio MCP server is not optional. A `type = "stdio"` entry carries the same grant
 fields as any other process (`workspace`, `env`, `filesystem`), Box synthesizes one
-process spec from the entry, and it runs through the one translator, so the same floors apply. The
-startup disclosure does **not**: it prints for `[agent]` and each `[tool.<name>]`, and the boundary of an MCP
-server's sandbox is built when the server starts, so an `[mcp.<name>.filesystem]` grant is kernel
-reach that no `fs:*` decision covers and no disclosure names. A server that declares no grants still
+process spec from the entry, and it runs through the one translator, so the same floors apply.
+Box approves and discloses every server's direct filesystem grants before the agent starts.
+A server's command resolves only when the agent requests that server.
+Box then prints the full boundary disclosure before launching it, including its runtime and environment.
+This preserves lazy server startup without hiding direct filesystem reach.
+`a_box_declaring_many_mcp_servers_still_runs` pins unused declarations without installed server programs.
+A server that declares no grants still
 runs contained, on the baseline every tool's and MCP server's sandbox gets. One escape exists and it is network-only: `[mcp.<name>.network] contain_egress = false` gives
 that server's sandbox direct egress instead of the gateway-routed default, for a trusted client that
 cannot honour `HTTPS_PROXY`. See

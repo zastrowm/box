@@ -55,8 +55,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) approved: Option<&'a DirectReach>,
 }
 
-/// The filesystem reach of `[agent]` and of every `[tool.<name>]`, judged once when the run starts
-/// and acted on at every spawn.
+/// The filesystem reach of `[agent]`, every `[tool.<name>]`, and every local `[mcp.<name>]`,
+/// judged once when the run starts and acted on at every spawn.
 #[derive(Debug)]
 pub(crate) struct ApprovedReach {
     tables: BTreeMap<String, DirectReach>,
@@ -76,8 +76,13 @@ impl ApprovedReach {
             .tool
             .iter()
             .map(|(label, spec)| (format!("[tool.{label}]"), spec));
+        let servers = stored
+            .contained_mcp
+            .iter()
+            .map(|(label, server)| (format!("[mcp.{label}]"), &server.spec));
         let tables = agent
             .chain(tools)
+            .chain(servers)
             .map(|(table, spec)| {
                 judge_filesystem(spec, &table, stored, protected_sources)
                     .map(|reach| (table, reach))
@@ -86,7 +91,7 @@ impl ApprovedReach {
         Ok(Self { tables })
     }
 
-    /// The reach approved for one table, named as a refusal names it: `[agent]` or `[tool.<name>]`.
+    /// The reach approved for one process table, named as a refusal names it.
     pub(crate) fn table(&self, table: &str) -> Option<&DirectReach> {
         self.tables.get(table)
     }
@@ -1427,7 +1432,7 @@ mod tests {
                     ("FOO".to_string(), "declared".to_string()),
                 ]),
                 filesystem: Filesystem {
-                    read: vec![self.path("vendor")],
+                    read: vec![self.path("vendor"), self.path("scratch")],
                     write: vec![self.path("scratch")],
                     read_file: vec![self.path("notes/api.md")],
                     write_file: vec![self.path("notes/api.md")],
@@ -1599,6 +1604,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut spec = fixture.spec();
         spec.filesystem = Filesystem {
+            read: vec![fixture.path("scratch")],
             write: vec![fixture.path("scratch")],
             ..Filesystem::default()
         };
@@ -1660,6 +1666,7 @@ mod tests {
         std::fs::create_dir(&inner).expect("a granted directory");
         let mut spec = fixture.spec();
         spec.filesystem = Filesystem {
+            read: vec![inner.clone()],
             write: vec![inner.clone()],
             ..Filesystem::default()
         };
@@ -1748,6 +1755,7 @@ mod tests {
         let source = plant_authority(&authority);
         let mut spec = fixture.spec();
         spec.filesystem = Filesystem {
+            read: vec![fixture.path("scratch")],
             write: vec![fixture.path("scratch")],
             ..Filesystem::default()
         };
@@ -1821,6 +1829,7 @@ mod tests {
         }
         let mut spec = fixture.spec();
         spec.filesystem = Filesystem {
+            read: vec![fixture.path("scratch")],
             write: vec![fixture.path("scratch")],
             deny,
             ..Filesystem::default()
@@ -2854,6 +2863,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut spec = fixture.spec();
         spec.command = vec![fixture.path("tools/run").display().to_string()];
+        spec.filesystem.read.push(fixture.path("tools"));
         spec.filesystem.write.push(fixture.path("tools"));
         spec.filesystem.exec = vec![fixture.path("bin/run")];
 
@@ -3651,11 +3661,24 @@ write = ["/Users/example/box-demo/aws-tmp"]
         assert_eq!(environment["ANTHROPIC_API_KEY"], "phantom-anthropic");
 
         // [tool.record-edit]
-        let hook = fixture.translate(
-            &example.spec(CONTRACT_RECORD_EDIT),
-            "[tool.record-edit]",
-            &[],
-        );
+        let mut hook_spec = example.spec(CONTRACT_RECORD_EDIT);
+        if cfg!(target_os = "linux") {
+            let error = crate::test_support::with_operator_home(fixture.operator.path(), || {
+                judge_filesystem(&hook_spec, "[tool.record-edit]", &fixture.record, &[])
+            })
+            .expect_err("the example requests unsupported write-only access");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Linux cannot enforce write-only"),
+                "{error}"
+            );
+            hook_spec
+                .filesystem
+                .read_file
+                .push(at("/Users/example/box-demo/hook-output/events.log"));
+        }
+        let hook = fixture.translate(&hook_spec, "[tool.record-edit]", &[]);
         let translated = cells(&hook);
         let has = |path: PathBuf, operation: Operation, scope: Scope| {
             translated.contains(&(path, operation, scope))
