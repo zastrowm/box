@@ -669,6 +669,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_action_the_schema_declares_is_in_the_reference_page() {
+        let page = include_str!("../../../docs/user/policy/actions.md");
+        for id in ACTION_IDS {
+            assert!(
+                page.contains(&format!("`{id}`")),
+                "docs/user/policy/actions.md names no `{id}`"
+            );
+        }
+    }
+
+    #[test]
     fn shipped_schema_parses() {
         assert!(schema().is_ok());
     }
