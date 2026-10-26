@@ -85,6 +85,29 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
+      # The reviewer prompt comes from the commit this workflow runs from (the
+      # default branch for a comment, the dispatched ref for a dispatch), never
+      # from the pull request head, so a pull request cannot rewrite the prompt
+      # that reviews it.
+      - name: Check out the reviewer prompt
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-prompt
+          persist-credentials: false
+          sparse-checkout: .github/strands/reviewer-system-prompt.md
+          sparse-checkout-cone-mode: false
+
+      - name: Read the reviewer prompt
+        id: prompt
+        run: |
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "suffix<<$delimiter"
+            cat trusted-prompt/.github/strands/reviewer-system-prompt.md
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Parse input
         id: parse
         uses: strands-agents/devtools/strands-command/actions/strands-input-parser@main
@@ -92,6 +115,9 @@ jobs:
           issue_id: ${{ inputs.issue_id }}
           command: ${{ inputs.command }}
           session_id: ${{ inputs.session_id }}
+          # Appended to the system prompt of every mode; the file itself limits
+          # its instructions to the reviewer.
+          system_prompt_suffix: ${{ steps.prompt.outputs.suffix }}
           # Auto-review supplies the event SHA via inputs.head_sha; a /strands
           # comment leaves it empty and uses the head resolved by the
           # authorization job. Either way the parser uses that commit instead of
@@ -100,19 +126,127 @@ jobs:
           head_repo: ${{ inputs.head_repo || needs.authorization-check.outputs.head-repo }}
           head_ref: ${{ inputs.head_ref || needs.authorization-check.outputs.head-ref }}
 
-  execute-readonly-agent:
+  # Builds strands-box from the commit the agent will check out, so the agent
+  # finds it on PATH instead of building it. This compiles untrusted PR code,
+  # so it holds a read-only token, no secrets, no OIDC, and never saves the
+  # cargo cache. The binaries are aarch64 because Linux containment is
+  # aarch64-only; the agent job runs on the same runner for that reason.
+  build-box:
     needs: [setup-and-process]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      # Same values as containment-deterministic.yml, so the cache key matches
+      # the cache that a push to main saves there.
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-C debuginfo=0"
+    outputs:
+      built: ${{ steps.build.outcome == 'success' }}
+    steps:
+      - name: Download parsed input artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: strands-parsed-input
+          path: ${{ runner.temp }}/parsed-input
+
+      - name: Read the commit to build
+        id: target
+        run: |
+          input="$RUNNER_TEMP/parsed-input/strands-parsed-input.json"
+          {
+            echo "ref=$(jq -r '.branch_name // ""' "$input")"
+            echo "head_sha=$(jq -r '.head_sha // ""' "$input")"
+            echo "head_repo=$(jq -r '.head_repo // ""' "$input")"
+          } >> "$GITHUB_OUTPUT"
+
+      # The same ref and repository the agent runner checks out.
+      - name: Checkout the commit under review
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.head_sha || steps.target.outputs.ref }}
+          repository: ${{ steps.target.outputs.head_repo || github.repository }}
+          persist-credentials: false
+
+      - name: Verify checkout SHA
+        if: steps.target.outputs.head_sha != ''
+        env:
+          EXPECTED: ${{ steps.target.outputs.head_sha }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::Checkout SHA mismatch: expected $EXPECTED, got $actual"
+            exit 1
+          fi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: containment-deterministic
+          # Restore only. A cache written from PR code would reach main's builds.
+          save-if: false
+          workspaces: |
+            .
+            test-integ
+
+      # A PR that does not compile still needs a review, so a failed build lets
+      # the agent run without the binaries.
+      - name: Build strands-box and the containment trampoline
+        id: build
+        continue-on-error: true
+        run: cargo build -p strands-box -p strands-box-containment --release --locked
+
+      - name: Upload strands-box binaries
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: strands-box-bin
+          path: |
+            target/release/strands-box
+            target/release/strands-box-sock-alias
+            target/release/strands-box-contain-trampoline
+          if-no-files-found: error
+          retention-days: 1
+
+  execute-readonly-agent:
+    needs: [setup-and-process, build-box]
+    # Runs when build-box fails, so a PR that does not build still gets a review.
+    if: ${{ !cancelled() && needs.setup-and-process.result == 'success' }}
     permissions:
       contents: read
       issues: read
       pull-requests: read
       id-token: write # Required for OIDC
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
-      # Add environment setup here if an agent needs it (a Rust toolchain, a
-      # language runtime, ...). The reviewer runs read-only over the diff and
-      # needs no build, so nothing is set up by default.
+      # Outside the workspace, because the runner checks out the repository
+      # there and replaces it.
+      - name: Download strands-box binaries
+        if: needs.build-box.outputs.built == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: strands-box-bin
+          path: ${{ runner.temp }}/strands-box-bin
+
+      - name: Put strands-box on PATH
+        if: needs.build-box.outputs.built == 'true'
+        run: |
+          bin="$RUNNER_TEMP/strands-box-bin"
+          chmod +x "$bin"/*
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Check strands-box
+        env:
+          BUILT: ${{ needs.build-box.outputs.built }}
+        run: |
+          if [ "$BUILT" != 'true' ]; then
+            echo "::warning::strands-box did not build; the agent runs without it"
+            exit 0
+          fi
+          command -v strands-box
+          strands-box --version
 
       - name: Run Strands Agent
         id: agent-runner
