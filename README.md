@@ -74,11 +74,36 @@ individual Dogwood decisions. To apply a policy to file operations, use the
 interpreters and keep those files out of the agent's direct grants. See
 [filesystem access](docs/user/security.md) and [policy](docs/user/policy.md).
 
+## Use Box as a Rust library
+
+Link the `strands-box` package in `crates/box`, then call:
+
+```rust,no_run
+let exit_code = strands_box::run("/absolute/box.toml".into(), Vec::new());
+```
+
+This runs the existing Box command in the calling process and waits until it finishes.
+It uses the process's terminal and returns its exit
+code. The second argument appends arguments to `[agent] command`.
+Call it before starting application threads or loading secrets, and use one Box workload
+per host process. Later `run` calls fail, even if the first call failed.
+Ship the matching Box helper binaries beside the host application.
+
+To generate policy schemas:
+
+```rust,no_run
+let exit_code = strands_box::generate_policy_schema(
+    "/absolute/box.toml".into(),
+    "/absolute/schemas".into(),
+);
+```
+
 ## Architecture
 
-Box runs the Dogwood Local Engine and its enforcement components in its own
-process, outside the agent's sandbox. Strands Shell, Monty, the egress gateway,
-and the MCP broker check operations with the engine before allowing them.
+Box runs the Dogwood Local Engine and its enforcement components outside the
+agent's sandbox, in either the Box command's process or the calling Rust
+application's process. Strands Shell, Monty, the egress gateway, and the MCP broker
+check operations with the engine before allowing them.
 They also record events that later policy decisions can use.
 
 ```mermaid

@@ -5,8 +5,6 @@ edition = "2024"
 publish = false
 description = "The standalone workload-only Strands zero-trust box CLI."
 
-# Box is a binary with no library target
-# (docs/design/decisions.md#box-is-a-process-and-reads-one-complete-configuration).
 [[bin]]
 name = "strands-box"
 path = "src/main.rs"
@@ -117,6 +115,10 @@ required-features = ["test-support"]
 name = "box-mcp-call-probe"
 path = "tests/support/mcp_call_probe.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "box_library"
+harness = false
 
 # Each end-to-end suite below spawns a test-only binary, so each carries the same gate: without it
 # a plain `cargo test` would build the suite while its probe is absent and fail on a missing binary.
