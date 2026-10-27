@@ -9,6 +9,11 @@ name: Strands Command Handler
 # Requires two repo secrets: AWS_ROLE_ARN (a GitHub OIDC role) and
 # AGENT_SESSIONS_BUCKET (an S3 bucket for agent session storage). Bedrock model
 # access must be enabled in us-west-2 for the role.
+#
+# Two optional repo variables pick the agent's model and reasoning effort:
+# STRANDS_MODEL_ID (a Bedrock model or inference profile ID that the role can
+# invoke) and STRANDS_REASONING_EFFORT (low, medium, high, or max). Unset gives
+# the runner default.
 
 on:
   issue_comment:
@@ -250,11 +255,17 @@ jobs:
 
       - name: Run Strands Agent
         id: agent-runner
-        uses: strands-agents/devtools/strands-command/actions/strands-agent-runner@main
+        # Temporary preview pin: the devtools fork branch that adds model_id and
+        # reasoning_effort. Point it back at strands-agents/devtools before upstream.
+        uses: zastrowm/devtools/strands-command/actions/strands-agent-runner@configurable-model-effort
         with:
           aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
           sessions_bucket: ${{ secrets.AGENT_SESSIONS_BUCKET }}
           write_permission: 'false'
+          # Repo variables, so a maintainer can change the model or effort without
+          # a commit. Unset gives the runner default.
+          model_id: ${{ vars.STRANDS_MODEL_ID }}
+          reasoning_effort: ${{ vars.STRANDS_REASONING_EFFORT }}
 
   finalize:
     if: always() && (startsWith(github.event.comment.body, '/strands') || github.event_name == 'workflow_dispatch')
