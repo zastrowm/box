@@ -147,6 +147,9 @@ jobs:
           aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
           sessions_bucket: ${{ secrets.AGENT_SESSIONS_BUCKET }}
           write_permission: 'false'
+          # The role in AWS_ROLE_ARN must be allowed to invoke this model.
+          model_id: global.anthropic.claude-opus-5-5
+          reasoning_effort: high
 
   finalize:
     if: always() && (startsWith(github.event.comment.body, '/strands') || github.event_name == 'workflow_dispatch')
