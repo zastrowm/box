@@ -115,7 +115,7 @@ jobs:
 
       - name: Parse input
         id: parse
-        uses: strands-agents/devtools/strands-command/actions/strands-input-parser@main
+        uses: zastrowm/devtools/strands-command/actions/strands-input-parser@devtools-pin-own-scripts
         with:
           issue_id: ${{ inputs.issue_id }}
           command: ${{ inputs.command }}
@@ -257,7 +257,7 @@ jobs:
         id: agent-runner
         # Temporary preview pin: the devtools fork branch that adds model_id and
         # reasoning_effort. Point it back at strands-agents/devtools before upstream.
-        uses: zastrowm/devtools/strands-command/actions/strands-agent-runner@configurable-model-effort
+        uses: zastrowm/devtools/strands-command/actions/strands-agent-runner@devtools-pin-own-scripts
         with:
           aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
           sessions_bucket: ${{ secrets.AGENT_SESSIONS_BUCKET }}
@@ -278,4 +278,4 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Execute write operations
-        uses: strands-agents/devtools/strands-command/actions/strands-finalize@main
+        uses: zastrowm/devtools/strands-command/actions/strands-finalize@devtools-pin-own-scripts
