@@ -70,7 +70,7 @@ jobs:
     steps:
       - name: Check Authorization
         id: auth
-        uses: strands-agents/devtools/authorization-check@main
+        uses: zastrowm/devtools/authorization-check@devtools-pin-own-scripts
         with:
           skip-check: ${{ github.event_name == 'workflow_dispatch' }}
           username: ${{ github.event.comment.user.login || 'invalid' }}
