@@ -72,8 +72,9 @@ jobs:
         id: auth
         uses: zastrowm/devtools/authorization-check@devtools-pin-own-scripts
         with:
-          skip-check: ${{ github.event_name == 'workflow_dispatch' }}
-          username: ${{ github.event.comment.user.login || 'invalid' }}
+          # Test-only: run the collaborator check on a dispatch too.
+          skip-check: false
+          username: ${{ github.event.comment.user.login || github.actor }}
           allowed-roles: 'maintain,triage,write,admin'
           issue-id: ${{ inputs.issue_id || github.event.issue.number }}
 
