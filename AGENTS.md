@@ -193,9 +193,10 @@ The first commit has a subject, then exactly these three sections in order:
 
 Later commits need only a subject that names the feedback or defect addressed.
 Follow [the pull request template](.github/PULL_REQUEST_TEMPLATE.md).
-Lead with the problem and reasoning the diff cannot show. State each decision the change depends on,
-checks continuous integration cannot perform, and deferred follow-ups with their reasons.
-Do not repeat the file list.
+Start with what changes, in the user's words: what they type or configure, what they see now, and
+what was broken or missing before. Then state the decisions the change records (by anchor), the
+docs it changes, the checks continuous integration cannot perform, and deferred follow-ups with
+their reasons. "None, because ..." is an answer. Do not repeat the file list.
 
 ## Docs
 
