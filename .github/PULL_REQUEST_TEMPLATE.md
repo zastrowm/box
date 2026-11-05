@@ -1,26 +1,28 @@
-## Description
-<!-- Provide a detailed description of the changes in this PR -->
+## What changes
 
-## Related Issues
+<!-- Two or three sentences in the user's words: what they type or configure, and what they see now.
+Say what was broken or missing before, when that is the reason for the change. -->
 
-<!-- Link to related issues using #issue-number format -->
+## Decisions
 
-## Type of Change
+<!-- One line for each entry in docs/design/decisions.md that this change adds or rewrites, linked
+by anchor. Mark a choice that a reviewer must approve. "None" is a valid answer. -->
 
-<!-- Choose one of the following types of changes, delete the rest -->
+## Docs
 
-Bug fix
-New feature
-Breaking change
-Documentation update
-Other (please describe):
+<!-- Each doc page this change updates. "None, because ..." is a valid answer. -->
 
-## Testing
+## Verification
 
-How have you tested the change? Verify that the changes do not break functionality or introduce new warnings.
+<!-- What you ran and what you tried by hand. Name any check CI cannot run, and any follow-up you
+left for later with its reason. -->
 
 - [ ] I ran the relevant suites (`just check`, or `cargo test --workspace --all-features`)
 - [ ] If I touched Rust, I ran `cargo fmt --all` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+## Related issues
+
+<!-- For example "Closes #123". "None" is a valid answer. -->
 
 ## Checklist
 - [ ] I have read the [CONTRIBUTING](../CONTRIBUTING.md) document
