@@ -15,7 +15,9 @@ use strands_shell::os::{
     DirEntry, Fd, FdKind, FileStat, FileTimes, OpenFlags, Process, TimeChange,
 };
 
+use crate::effect::EffectResult;
 use crate::kernel::Follow;
+use crate::writer::ServedWriter;
 
 /// The channel depth of one host writer, in chunks.
 const HOST_WRITER_DEPTH: usize = 16;
@@ -408,7 +410,7 @@ fn open_file(
     Ok(file)
 }
 
-/// Open the pinned file as a descriptor of `proc`.
+/// Open the pinned file as a descriptor of `proc`, with the drain of a write descriptor.
 ///
 /// A write reaches the host before the writer's `write` returns, so a command's status follows
 /// its bytes.
@@ -417,7 +419,7 @@ pub(super) async fn open(
     host_path: &Path,
     flags: &OpenFlags,
     expected: Option<&HostIdentity>,
-) -> io::Result<Fd> {
+) -> io::Result<(Fd, Option<ServedWriter>)> {
     let mut file = open_file(host_path, flags, expected)?;
     if flags.read && !flags.write {
         let mut data = Vec::new();
@@ -425,10 +427,11 @@ pub(super) async fn open(
         let (tx, rx) = strands_shell::os::pipe(data.len().max(64));
         let _ = tx.send(bytes::Bytes::from(data)).await;
         drop(tx);
-        return proc.alloc_fd(FdKind::ChannelReader {
+        let fd = proc.alloc_fd(FdKind::ChannelReader {
             rx,
             buf: Vec::new(),
-        });
+        })?;
+        return Ok((fd, None));
     }
     if !flags.write {
         return Err(io::Error::new(
@@ -441,32 +444,37 @@ pub(super) async fn open(
     }
     let (tx, rx) = strands_shell::os::pipe(HOST_WRITER_DEPTH);
     let failed = Arc::new(AtomicBool::new(false));
+    let sender = tx.downgrade();
     let fd = proc.alloc_fd(FdKind::ChannelWriter {
         tx,
         error_flag: Some(Arc::clone(&failed)),
     })?;
-    tokio::task::spawn_local(drain(rx, file, flags.append, failed));
-    Ok(fd)
+    let drain = Box::pin(drain(rx, file, flags.append, failed));
+    Ok((fd, Some(ServedWriter { sender, drain })))
 }
 
 /// Write each chunk to `file` as it arrives, before the writer sees it accepted.
+///
+/// A failed write or final truncation leaves part of the write in place, so it is indeterminate.
 async fn drain(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     mut file: File,
     append: bool,
     failed: Arc<AtomicBool>,
-) {
+) -> EffectResult {
     let mut written = 0_u64;
     while let Some(chunk) = rx.recv().await {
         if file.write_all(&chunk).is_err() {
             failed.store(true, Ordering::Relaxed);
-            return;
+            return EffectResult::Indeterminate;
         }
         written += chunk.len() as u64;
     }
     if !append && file.set_len(written).is_err() {
         failed.store(true, Ordering::Relaxed);
+        return EffectResult::Indeterminate;
     }
+    EffectResult::Completed
 }
 
 /// List a host directory.
