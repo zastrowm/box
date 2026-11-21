@@ -5,6 +5,8 @@ name: Corpus
 # test-corpus/README.md says how to dispatch it and fetch the results.
 
 on:
+  push:
+    branches: [test/cli-test-corpus-push]
   workflow_dispatch:
     inputs:
       ids:

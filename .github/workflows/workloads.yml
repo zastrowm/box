@@ -47,6 +47,8 @@ name: Workloads
 # does. Kiro CLI's model checks use the KIRO_API_KEY secret. The others call no model.
 
 on:
+  push:
+    branches: [test/cli-test-corpus-push]
   workflow_dispatch:
     inputs:
       agent:
