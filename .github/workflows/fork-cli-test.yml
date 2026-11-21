@@ -1,0 +1,12 @@
+name: "Fork: CLI test"
+on:
+  push:
+    branches: [test/cli-test-corpus-kiro-pin]
+permissions:
+  contents: read
+jobs:
+  cli:
+    uses: ./.github/workflows/cli-test.yml
+    with:
+      suite: all
+      macos: true
