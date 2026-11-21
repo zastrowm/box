@@ -97,7 +97,10 @@ class MovedCommandTests(unittest.TestCase):
             ("Build", "cargo build --locked --all-features -p strands-box-cli -p strands-box "
                       "-p strands-box-containment --bin box --bin strands-box "
                       "--bin strands-box-sock-alias --bin strands-box-contain-trampoline"),
-            ("Test", "cargo test -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features"),
+            ("Test", "status=0\n"
+                     "cargo nextest run -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features --no-tests=warn || status=$?\n"
+                     "cargo test --doc -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features || status=$?\n"
+                     "exit \"$status\""),
         ]:
             with self.subTest(step=step):
                 self.assertEqual(step_run(CLI_TEST, "build-test-lint", step), command)
@@ -109,8 +112,9 @@ class MovedCommandTests(unittest.TestCase):
         test = step_run(CLI_TEST, "macos", "Test")
         self.assertIn('  *) echo "::error::full Xcode is not selected: $developer_dir"; exit 1 ;;\n',
                       test)
-        self.assertIn("  cargo test -p strands-box-cli --all-features --test engine\n", test)
-        self.assertIn("else\n  cargo test -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features\nfi", test)
+        self.assertIn("  cargo nextest run -p strands-box-cli --all-features --test engine\n", test)
+        self.assertIn("else\n  status=0\n  cargo nextest run -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features --no-tests=warn || status=$?\n", test)
+        self.assertIn("  cargo test --doc -p strands-box-cli -p strands-box-cli-pack-tests -p strands-box-cli-profile -p strands-box-cli-telemetry --all-features || status=$?\n  exit \"$status\"\nfi", test)
 
 
 class SuiteStepTests(unittest.TestCase):

@@ -226,6 +226,11 @@ jobs:
       - name: Fetch locked dependencies for offline metadata
         run: cargo fetch --locked
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+
       - name: Install non-framework Python (macOS only)
         if: matrix.os == 'macos-latest'
         # `macos-latest`'s Homebrew Python is a framework build: `bin/python3` is a
@@ -283,9 +288,13 @@ jobs:
         run: |
           set -o pipefail
           set +e
-          cargo test --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose ${FILTER:+"$FILTER"} \
-            -- --show-output 2>&1 | tee linux-workspace-tests.log
+          cargo nextest run --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose \
+            --success-output immediate --no-tests=warn ${FILTER:+"$FILTER"} 2>&1 | tee linux-workspace-tests.log
           test_status=$?
+          cargo test --doc --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose ${FILTER:+"$FILTER"} \
+            -- --show-output 2>&1 | tee -a linux-workspace-tests.log
+          doc_status=$?
+          [ "$test_status" -eq 0 ] && test_status=$doc_status
           set -e
           python3 scripts/check-linux-test-output.py linux-workspace-tests.log | tee -a "$GITHUB_STEP_SUMMARY"
           exit "$test_status"
@@ -319,7 +328,10 @@ jobs:
           FAIL_FAST_FLAG: ${{ !inputs.fail_fast && '--no-fail-fast' || '' }}
           FILTER: ${{ inputs.filter }}
         run: |
-          cargo test --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose ${FILTER:+"$FILTER"}
+          status=0
+          cargo nextest run --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose --no-tests=warn ${FILTER:+"$FILTER"} || status=$?
+          cargo test --doc --workspace $EXCLUDE_CLI --locked --all-features $FAIL_FAST_FLAG --verbose ${FILTER:+"$FILTER"} || status=$?
+          exit "$status"
 
       # The native filesystem checks the workspace run above does not cover: the
       # standalone signed test package, startup refusal without the Cargo feature,
