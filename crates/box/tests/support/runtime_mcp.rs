@@ -1301,6 +1301,51 @@ impl RunningMcpClient {
         stdin.flush().expect("flush one MCP frame");
     }
 
+    /// DIAGNOSTIC (mcp-probe): the alias's exit state, any frames it produced, and its stderr.
+    /// Kills the alias (if still running) so its stderr reaches EOF.
+    #[allow(dead_code)]
+    pub fn probe_diagnostic(&mut self) -> String {
+        let mut report = String::new();
+        let Some(child) = self.child.as_mut() else {
+            return "alias child already taken".to_string();
+        };
+        let pid = child.id();
+        let before = child.try_wait();
+        report.push_str(&format!("alias pid {pid}; status at timeout: {before:?}\n"));
+        let mut frames = Vec::new();
+        while let Ok(frame) = self.received.try_recv() {
+            frames.push(format!("{frame:?}"));
+        }
+        report.push_str(&format!("alias stdout frames so far: {frames:?}\n"));
+        if matches!(before, Ok(None)) {
+            let _ = child.kill();
+        }
+        let after = child.wait();
+        report.push_str(&format!("alias status after kill: {after:?}\n"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && self
+                .stderr_thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+        {
+            std::thread::sleep(POLL);
+        }
+        if self
+            .stderr_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            if let Some(thread) = self.stderr_thread.take() {
+                let _ = thread.join();
+            }
+            report.push_str(&format!("alias stderr:\n{}", self.stderr_text()));
+        } else {
+            report.push_str("alias stderr: reader still blocked 3s after kill (pipe held open by a descendant)");
+        }
+        report
+    }
+
     fn join_readers(&mut self) {
         if let Some(thread) = self.output_thread.take() {
             thread.join().expect("join the MCP output reader");
@@ -1385,11 +1430,43 @@ impl RunningBox {
         self.wait_for(path, timeout + allowance);
     }
 
+    /// DIAGNOSTIC (mcp-probe): `wait_for_through_alias`, with `extra` reporting the client's
+    /// state if the wait times out.
+    pub fn wait_for_through_alias_with(
+        &mut self,
+        path: impl AsRef<Path>,
+        timeout: Duration,
+        extra: &mut dyn FnMut() -> String,
+    ) {
+        let allowance = if self.alias_exec_awaited {
+            Duration::ZERO
+        } else {
+            FIRST_ALIAS_EXEC
+        };
+        self.alias_exec_awaited = true;
+        self.wait_for_with(path, timeout + allowance, extra);
+    }
+
     pub fn wait_for(&mut self, path: impl AsRef<Path>, timeout: Duration) {
+        self.wait_for_with(path, timeout, &mut String::new);
+    }
+
+    pub fn wait_for_with(
+        &mut self,
+        path: impl AsRef<Path>,
+        timeout: Duration,
+        extra: &mut dyn FnMut() -> String,
+    ) {
         let path = path.as_ref();
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         while Instant::now() < deadline {
             if path.exists() {
+                eprintln!(
+                    "[mcp-probe] {} appeared after {:?}",
+                    path.display(),
+                    started.elapsed()
+                );
                 return;
             }
             if self
@@ -1411,7 +1488,40 @@ impl RunningBox {
             }
             std::thread::sleep(POLL);
         }
-        panic!("{} did not appear within {timeout:?}", path.display());
+        // DIAGNOSTIC (mcp-probe): capture everything before killing anything.
+        let processes = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,stat,etimes,wchan:32,args", "--forest"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|e| format!("ps failed: {e}"));
+        let client = extra();
+        let home = self.home.clone();
+        let files = probe_dump_tree(&home);
+        let mut child = self.child.take().expect("the run is present");
+        let box_status = child.try_wait().ok().flatten();
+        // SAFETY: signalling the child this harness spawned.
+        let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let term_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < term_deadline && child.try_wait().ok().flatten().is_none() {
+            std::thread::sleep(POLL);
+        }
+        let _ = child.kill();
+        let final_status = child.wait().ok();
+        std::thread::sleep(Duration::from_millis(500));
+        let stdout = String::from_utf8_lossy(&self.stdout.snapshot()).into_owned();
+        let stderr = String::from_utf8_lossy(&self.stderr.snapshot()).into_owned();
+        panic!(
+            "{} did not appear within {timeout:?}\n\
+             ===== [mcp-probe] box status at timeout: {box_status:?}; after kill: {final_status:?}\n\
+             ===== [mcp-probe] strands-box stdout:\n{stdout}\n\
+             ===== [mcp-probe] strands-box stderr:\n{stderr}\n\
+             ===== [mcp-probe] client:\n{client}\n\
+             ===== [mcp-probe] files under {}:\n{files}\n\
+             ===== [mcp-probe] processes:\n{processes}\n\
+             ===== [mcp-probe] end",
+            path.display(),
+            home.display()
+        );
     }
 
     pub fn wait(mut self, timeout: Duration) -> Output {
@@ -1494,6 +1604,76 @@ pub fn process_exists(pid: u32) -> bool {
     // SAFETY: signal 0 checks one numeric process id and sends no signal.
     (unsafe { libc::kill(pid, 0) == 0 })
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// DIAGNOSTIC (mcp-probe): list every entry under `root` and print the control directory's
+/// files plus any log file. Regular files only are read, so a FIFO never blocks the dump.
+fn probe_dump_tree(root: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut listing = String::new();
+    let mut contents = String::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut entries = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            let _ = writeln!(listing, "  (unreadable dir) {}", dir.display());
+            continue;
+        };
+        let mut children: Vec<_> = read.filter_map(Result::ok).map(|e| e.path()).collect();
+        children.sort();
+        for child in children {
+            entries += 1;
+            if entries > 800 {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&child) else {
+                continue;
+            };
+            let kind = meta.file_type();
+            let tag = if kind.is_dir() {
+                "d"
+            } else if kind.is_symlink() {
+                "l"
+            } else if kind.is_file() {
+                "f"
+            } else {
+                "s"
+            };
+            let relative = child.strip_prefix(root).unwrap_or(&child);
+            let _ = writeln!(
+                listing,
+                "  {tag} {:>8} {:o} {}",
+                meta.len(),
+                meta.permissions().mode() & 0o7777,
+                relative.display()
+            );
+            if kind.is_dir() {
+                stack.push(child.clone());
+            }
+            let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let in_control = child
+                .parent()
+                .is_some_and(|p| p.ends_with(CONTROL_DIRECTORY));
+            let is_log = name.ends_with(".log") || name.ends_with(".jsonl") || name.ends_with(".err");
+            if kind.is_file() && (in_control || is_log) {
+                let limit = if in_control { 4096 } else { 16384 };
+                let bytes = std::fs::read(&child).unwrap_or_default();
+                let start = bytes.len().saturating_sub(limit);
+                let _ = writeln!(
+                    contents,
+                    "--- {} ({} bytes{}) ---\n{}",
+                    relative.display(),
+                    bytes.len(),
+                    if start > 0 { ", tail" } else { "" },
+                    String::from_utf8_lossy(&bytes[start..])
+                );
+            }
+        }
+    }
+    if entries > 800 {
+        let _ = writeln!(listing, "  ... {} more entries", entries - 800);
+    }
+    format!("{listing}\n{contents}")
 }
 
 fn read_pid(path: &Path) -> u32 {
